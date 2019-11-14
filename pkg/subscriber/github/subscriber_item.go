@@ -62,29 +62,20 @@ const (
 	Path = "path"
 )
 
-// In the cloned git repo root, find all helm chart directories
-var chartDirs map[string]string
-
-// Apply CustomResourceDefinition and Namespace Kubernetes resources first
-var crdsAndNamespaceFiles []string
-
-// Then apply ServiceAccount, ClusterRole and Role Kubernetes resources next
-var rbacFiles []string
-
-// Then apply the rest of resource
-var otherFiles []string
-
-// Helm index file
-var indexFile *repo.IndexFile
-
 // SubscriberItem - defines the unit of namespace subscription
 type SubscriberItem struct {
 	appv1alpha1.SubscriberItem
 
-	commitID     string
-	stopch       chan struct{}
-	syncinterval int
-	synchronizer *kubesynchronizer.KubeSynchronizer
+	stopch                chan struct{}
+	syncinterval          int
+	synchronizer          *kubesynchronizer.KubeSynchronizer
+	repoRoot              string
+	commitID              string
+	chartDirs             map[string]string
+	crdsAndNamespaceFiles []string
+	rbacFiles             []string
+	otherFiles            []string
+	indexFile             *repo.IndexFile
 }
 
 type kubeResource struct {
@@ -103,6 +94,17 @@ func (ghsi *SubscriberItem) Start() {
 	ghsi.stopch = make(chan struct{})
 
 	go wait.Until(func() {
+		tw := ghsi.SubscriberItem.Subscription.Spec.TimeWindow
+		if tw != nil {
+			nextRun := utils.NextStartPoint(tw, time.Now())
+			if nextRun > time.Duration(0) {
+				klog.V(1).Infof("Subcription %v/%v will de deploy after %v",
+					ghsi.SubscriberItem.Subscription.GetNamespace(),
+					ghsi.SubscriberItem.Subscription.GetName(), nextRun)
+				return
+			}
+		}
+
 		err := ghsi.doSubscription()
 		if err != nil {
 			klog.Error(err, "Subscription error.")
@@ -138,23 +140,23 @@ func (ghsi *SubscriberItem) doSubscription() error {
 		kvalid := ghsi.synchronizer.CreateValiadtor(syncsource)
 		rscPkgMap := make(map[string]bool)
 
-		klog.V(4).Info("Applying resources: ", crdsAndNamespaceFiles)
+		klog.V(4).Info("Applying resources: ", ghsi.crdsAndNamespaceFiles)
 
-		ghsi.subscribeResources(hostkey, syncsource, kvalid, rscPkgMap, crdsAndNamespaceFiles)
+		ghsi.subscribeResources(hostkey, syncsource, kvalid, rscPkgMap, ghsi.crdsAndNamespaceFiles)
 
-		klog.V(4).Info("Applying resources: ", rbacFiles)
+		klog.V(4).Info("Applying resources: ", ghsi.rbacFiles)
 
-		ghsi.subscribeResources(hostkey, syncsource, kvalid, rscPkgMap, rbacFiles)
+		ghsi.subscribeResources(hostkey, syncsource, kvalid, rscPkgMap, ghsi.rbacFiles)
 
-		klog.V(4).Info("Applying resources: ", otherFiles)
+		klog.V(4).Info("Applying resources: ", ghsi.otherFiles)
 
-		ghsi.subscribeResources(hostkey, syncsource, kvalid, rscPkgMap, otherFiles)
+		ghsi.subscribeResources(hostkey, syncsource, kvalid, rscPkgMap, ghsi.otherFiles)
 
 		ghsi.synchronizer.ApplyValiadtor(kvalid)
 
 		klog.V(4).Info("Applying helm charts..")
 
-		err = ghsi.subscribeHelmCharts(indexFile)
+		err = ghsi.subscribeHelmCharts(ghsi.indexFile)
 
 		if err != nil {
 			klog.Error(err, "Unable to subscribe helm charts")
@@ -162,6 +164,12 @@ func (ghsi *SubscriberItem) doSubscription() error {
 		}
 
 		ghsi.commitID = commitID
+
+		ghsi.chartDirs = nil
+		ghsi.crdsAndNamespaceFiles = nil
+		ghsi.rbacFiles = nil
+		ghsi.otherFiles = nil
+		ghsi.indexFile = nil
 	} else {
 		klog.V(4).Info("The commit ID is same as before. Skip processing the cloned repo")
 	}
@@ -170,11 +178,10 @@ func (ghsi *SubscriberItem) doSubscription() error {
 }
 
 func (ghsi *SubscriberItem) getKubeIgnore() *gitignore.GitIgnore {
-	repoRoot := filepath.Join(os.TempDir(), ghsi.Channel.Namespace, ghsi.Channel.Name)
-	resourcePath := repoRoot
+	resourcePath := ghsi.repoRoot
 
 	if ghsi.SubscriberItem.SubscriptionConfigMap != nil {
-		resourcePath = filepath.Join(repoRoot, ghsi.SubscriberItem.SubscriptionConfigMap.Data["path"])
+		resourcePath = filepath.Join(ghsi.repoRoot, ghsi.SubscriberItem.SubscriptionConfigMap.Data["path"])
 	}
 
 	klog.V(4).Info("Git repo resource root directory: ", resourcePath)
@@ -420,6 +427,7 @@ func (ghsi *SubscriberItem) subscribeHelmCharts(indexFile *repo.IndexFile) (err 
 							GitHub: &releasev1alpha1.GitHub{
 								Urls:      []string{ghsi.Channel.Spec.PathName},
 								ChartPath: chartVersions[0].URLs[0],
+								Branch:    ghsi.getGitBranch().Short(),
 							},
 						},
 						ConfigMapRef: ghsi.Channel.Spec.ConfigMapRef,
@@ -445,6 +453,7 @@ func (ghsi *SubscriberItem) subscribeHelmCharts(indexFile *repo.IndexFile) (err 
 					GitHub: &releasev1alpha1.GitHub{
 						Urls:      []string{ghsi.Channel.Spec.PathName},
 						ChartPath: chartVersions[0].URLs[0],
+						Branch:    ghsi.getGitBranch().Short(),
 					},
 				},
 				ConfigMapRef: ghsi.Channel.Spec.ConfigMapRef,
@@ -522,7 +531,7 @@ func (ghsi *SubscriberItem) cloneGitRepo() (commitID string, err error) {
 		Depth:             1,
 		SingleBranch:      true,
 		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
-		ReferenceName:     plumbing.Master,
+		ReferenceName:     ghsi.getGitBranch(),
 	}
 
 	if ghsi.Channel.Spec.SecretRef != nil {
@@ -566,23 +575,23 @@ func (ghsi *SubscriberItem) cloneGitRepo() (commitID string, err error) {
 		}
 	}
 
-	repoRoot := filepath.Join(os.TempDir(), ghsi.Channel.Namespace, ghsi.Channel.Name)
-	if _, err := os.Stat(repoRoot); os.IsNotExist(err) {
-		err = os.MkdirAll(repoRoot, os.ModePerm)
+	ghsi.repoRoot = filepath.Join(os.TempDir(), ghsi.Channel.Namespace, ghsi.Channel.Name)
+	if _, err := os.Stat(ghsi.repoRoot); os.IsNotExist(err) {
+		err = os.MkdirAll(ghsi.repoRoot, os.ModePerm)
 		if err != nil {
-			klog.Error(err, "Failed to make directory ", repoRoot)
+			klog.Error(err, "Failed to make directory ", ghsi.repoRoot)
 			return "", err
 		}
 	} else {
-		err = os.RemoveAll(repoRoot)
+		err = os.RemoveAll(ghsi.repoRoot)
 		if err != nil {
-			klog.Error(err, "Failed to remove directory ", repoRoot)
+			klog.Error(err, "Failed to remove directory ", ghsi.repoRoot)
 			return "", err
 		}
 	}
 
-	klog.V(4).Info("Cloning ", ghsi.Channel.Spec.PathName, " into ", repoRoot)
-	r, err := git.PlainClone(repoRoot, false, options)
+	klog.V(4).Info("Cloning ", ghsi.Channel.Spec.PathName, " into ", ghsi.repoRoot)
+	r, err := git.PlainClone(ghsi.repoRoot, false, options)
 
 	if err != nil {
 		klog.Error(err, "Failed to git clone: ", err.Error())
@@ -604,6 +613,25 @@ func (ghsi *SubscriberItem) cloneGitRepo() (commitID string, err error) {
 	return commit.ID().String(), nil
 }
 
+func (ghsi *SubscriberItem) getGitBranch() plumbing.ReferenceName {
+	branch := plumbing.Master
+
+	if ghsi.SubscriberItem.SubscriptionConfigMap != nil {
+		if ghsi.SubscriberItem.SubscriptionConfigMap.Data["branch"] != "" {
+			branchStr := ghsi.SubscriberItem.SubscriptionConfigMap.Data["branch"]
+			if !strings.HasPrefix(branchStr, "refs/heads/") {
+				branchStr = "refs/heads/" + ghsi.SubscriberItem.SubscriptionConfigMap.Data["branch"]
+			}
+
+			branch = plumbing.ReferenceName(branchStr)
+		}
+	}
+
+	klog.V(4).Info("Subscribing to branch: ", branch)
+
+	return branch
+}
+
 func (ghsi *SubscriberItem) sortClonedGitRepo() error {
 	if ghsi.Subscription.Spec.PackageFilter != nil && ghsi.Subscription.Spec.PackageFilter.FilterRef != nil {
 		ghsi.SubscriberItem.SubscriptionConfigMap = &corev1.ConfigMap{}
@@ -618,25 +646,24 @@ func (ghsi *SubscriberItem) sortClonedGitRepo() error {
 		}
 	}
 
-	repoRoot := filepath.Join(os.TempDir(), ghsi.Channel.Namespace, ghsi.Channel.Name)
-	resourcePath := repoRoot
+	resourcePath := ghsi.repoRoot
 
 	if ghsi.SubscriberItem.SubscriptionConfigMap != nil {
-		resourcePath = filepath.Join(repoRoot, ghsi.SubscriberItem.SubscriptionConfigMap.Data["path"])
+		resourcePath = filepath.Join(ghsi.repoRoot, ghsi.SubscriberItem.SubscriptionConfigMap.Data["path"])
 	}
 
 	// chartDirs contains helm chart directories
 	// crdsAndNamespaceFiles contains CustomResourceDefinition and Namespace Kubernetes resources file paths
 	// rbacFiles contains ServiceAccount, ClusterRole and Role Kubernetes resource file paths
 	// otherFiles contains all other Kubernetes resource file paths
-	err := ghsi.sortResources(repoRoot, resourcePath)
+	err := ghsi.sortResources(ghsi.repoRoot, resourcePath)
 	if err != nil {
 		klog.Error(err, "Failed to sort kubernetes resources and helm charts.")
 		return err
 	}
 
 	// Build a helm repo index file
-	err = ghsi.generateHelmIndexFile(repoRoot, chartDirs)
+	err = ghsi.generateHelmIndexFile(ghsi.repoRoot, ghsi.chartDirs)
 
 	if err != nil {
 		// If package name is not specified in the subscription, filterCharts throws an error. In this case, just return the original index file.
@@ -644,7 +671,7 @@ func (ghsi *SubscriberItem) sortClonedGitRepo() error {
 		return err
 	}
 
-	b, _ := yaml.Marshal(indexFile)
+	b, _ := yaml.Marshal(ghsi.indexFile)
 	klog.V(4).Info("New index file ", string(b))
 
 	return nil
@@ -654,14 +681,14 @@ func (ghsi *SubscriberItem) sortResources(repoRoot string, resourcePath string) 
 	klog.V(4).Info("Git repo resource root directory: ", resourcePath)
 
 	// In the cloned git repo root, find all helm chart directories
-	chartDirs = make(map[string]string)
+	ghsi.chartDirs = make(map[string]string)
 
 	// Apply CustomResourceDefinition and Namespace Kubernetes resources first
-	crdsAndNamespaceFiles = []string{}
+	ghsi.crdsAndNamespaceFiles = []string{}
 	// Then apply ServiceAccount, ClusterRole and Role Kubernetes resources next
-	rbacFiles = []string{}
+	ghsi.rbacFiles = []string{}
 	// Then apply the rest of resource
-	otherFiles = []string{}
+	ghsi.otherFiles = []string{}
 
 	currentChartDir := "NONE"
 
@@ -686,7 +713,7 @@ func (ghsi *SubscriberItem) sortResources(repoRoot string, resourcePath string) 
 						klog.V(4).Info("Found Chart.yaml in ", path)
 						if !strings.HasPrefix(path, currentChartDir) {
 							klog.V(4).Info("This is a helm chart folder.")
-							chartDirs[path+"/"] = path + "/"
+							ghsi.chartDirs[path+"/"] = path + "/"
 							currentChartDir = path + "/"
 						}
 					}
@@ -723,17 +750,17 @@ func (ghsi *SubscriberItem) sortKubeResources(path string) error {
 
 		if t.APIVersion != "" && t.Kind != "" {
 			if strings.EqualFold(t.Kind, "customresourcedefinition") {
-				crdsAndNamespaceFiles = append(crdsAndNamespaceFiles, path)
+				ghsi.crdsAndNamespaceFiles = append(ghsi.crdsAndNamespaceFiles, path)
 			} else if strings.EqualFold(t.Kind, "namespace") {
-				crdsAndNamespaceFiles = append(crdsAndNamespaceFiles, path)
+				ghsi.crdsAndNamespaceFiles = append(ghsi.crdsAndNamespaceFiles, path)
 			} else if strings.EqualFold(t.Kind, "serviceaccount") {
-				rbacFiles = append(rbacFiles, path)
+				ghsi.rbacFiles = append(ghsi.rbacFiles, path)
 			} else if strings.EqualFold(t.Kind, "clusterrole") {
-				rbacFiles = append(rbacFiles, path)
+				ghsi.rbacFiles = append(ghsi.rbacFiles, path)
 			} else if strings.EqualFold(t.Kind, "role") {
-				rbacFiles = append(rbacFiles, path)
+				ghsi.rbacFiles = append(ghsi.rbacFiles, path)
 			} else {
-				otherFiles = append(otherFiles, path)
+				ghsi.otherFiles = append(ghsi.otherFiles, path)
 			}
 		}
 	}
@@ -743,7 +770,7 @@ func (ghsi *SubscriberItem) sortKubeResources(path string) error {
 
 func (ghsi *SubscriberItem) generateHelmIndexFile(repoRoot string, chartDirs map[string]string) error {
 	// Build a helm repo index file
-	indexFile = repo.NewIndexFile()
+	ghsi.indexFile = repo.NewIndexFile()
 
 	for chartDir := range chartDirs {
 		chartFolderName := filepath.Base(chartDir)
@@ -759,12 +786,12 @@ func (ghsi *SubscriberItem) generateHelmIndexFile(repoRoot string, chartDirs map
 			return err
 		}
 
-		indexFile.Add(chartMetadata, chartFolderName, chartBaseDir, "generated-by-multicloud-operators-subscription")
+		ghsi.indexFile.Add(chartMetadata, chartFolderName, chartBaseDir, "generated-by-multicloud-operators-subscription")
 	}
 
-	indexFile.SortEntries()
+	ghsi.indexFile.SortEntries()
 
-	ghsi.filterCharts(indexFile)
+	ghsi.filterCharts(ghsi.indexFile)
 
 	return nil
 }

@@ -78,6 +78,17 @@ func (hrsi *SubscriberItem) Start() {
 	hrsi.stopch = make(chan struct{})
 
 	go wait.Until(func() {
+		tw := hrsi.SubscriberItem.Subscription.Spec.TimeWindow
+		if tw != nil {
+			nextRun := utils.NextStartPoint(tw, time.Now())
+			if nextRun > time.Duration(0) {
+				klog.V(1).Infof("Subcription %v/%v will de deploy after %v",
+					hrsi.SubscriberItem.Subscription.GetNamespace(),
+					hrsi.SubscriberItem.Subscription.GetName(), nextRun)
+				return
+			}
+		}
+
 		hrsi.doSubscription()
 	}, time.Duration(hrsi.syncinterval)*time.Second, hrsi.stopch)
 }
@@ -311,6 +322,16 @@ func (hrsi *SubscriberItem) removeNoMatchingName(indexFile *repo.IndexFile) erro
 	return nil
 }
 
+//checkKeywords Checks if the charts has at least 1 keyword from the packageFilter.Keywords array
+func (hrsi *SubscriberItem) checkKeywords(chartVersion *repo.ChartVersion) bool {
+	var labelSelector *metav1.LabelSelector
+	if hrsi.Subscription.Spec.PackageFilter != nil {
+		labelSelector = hrsi.Subscription.Spec.PackageFilter.LabelSelector
+	}
+
+	return utils.KeywordsChecker(labelSelector, chartVersion.Keywords)
+}
+
 //filterOnVersion filters the indexFile with the version, tillerVersion and Digest provided in the subscription
 //The version provided in the subscription can be an expression like ">=1.2.3" (see https://github.com/blang/semver)
 //The tillerVersion and the digest provided in the subscription must be literals.
@@ -325,7 +346,7 @@ func (hrsi *SubscriberItem) filterOnVersion(indexFile *repo.IndexFile) {
 		newChartVersions := make([]*repo.ChartVersion, 0)
 
 		for index, chartVersion := range chartVersions {
-			if hrsi.checkDigest(chartVersion) && hrsi.checkTillerVersion(chartVersion) && hrsi.checkVersion(chartVersion) {
+			if hrsi.checkKeywords(chartVersion) && hrsi.checkDigest(chartVersion) && hrsi.checkTillerVersion(chartVersion) && hrsi.checkVersion(chartVersion) {
 				newChartVersions = append(newChartVersions, chartVersions[index])
 			}
 		}
@@ -399,7 +420,7 @@ func (hrsi *SubscriberItem) checkVersion(chartVersion *repo.ChartVersion) bool {
 				versionVersion, err := semver.Parse(version)
 
 				if err != nil {
-					klog.Error(err)
+					klog.V(3).Info("Skipping error in parsing version, taking it as not match. The error is:", err)
 					return false
 				}
 
@@ -478,22 +499,11 @@ func (hrsi *SubscriberItem) manageHelmCR(indexFile *repo.IndexFile, repoURL stri
 	for packageName, chartVersions := range indexFile.Entries {
 		klog.V(5).Infof("chart: %s\n%v", packageName, chartVersions)
 
-		//Compose release name
 		helmReleaseNewName := packageName + "-" + hrsi.Subscription.Name + "-" + hrsi.Subscription.Namespace
-		//Trunc the releaseName
-		//Max is 53 chars but as helm add behind the scene extension -delete-registrations for some objects
-		//The new limit is 32 chars
-		//Code remove managed at the helm-crd level
-		// if len(releaseName) > 32 {
-		// 	releaseName = releaseName[0:31]
-		// }
 
 		helmRelease := &releasev1alpha1.HelmRelease{}
 		//Create a new helrmReleases
 		//Try to retrieve the releases to check if we have to reuse the releaseName or calculate one.
-
-		err = hrsi.synchronizer.LocalClient.Get(context.TODO(),
-			types.NamespacedName{Name: helmReleaseNewName, Namespace: hrsi.Subscription.Namespace}, helmRelease)
 
 		for i := range chartVersions[0].URLs {
 			parsedURL, err := url.Parse(chartVersions[0].URLs[i])
@@ -510,6 +520,9 @@ func (hrsi *SubscriberItem) manageHelmCR(indexFile *repo.IndexFile, repoURL stri
 			}
 		}
 		//Check if Update or Create
+		err = hrsi.synchronizer.LocalClient.Get(context.TODO(),
+			types.NamespacedName{Name: helmReleaseNewName, Namespace: hrsi.Subscription.Namespace}, helmRelease)
+
 		if err != nil {
 			if errors.IsNotFound(err) {
 				klog.V(2).Infof("Create helmRelease %s", helmReleaseNewName)
@@ -544,7 +557,7 @@ func (hrsi *SubscriberItem) manageHelmCR(indexFile *repo.IndexFile, repoURL stri
 					},
 				}
 			} else {
-				klog.Error(err)
+				klog.Error("Error in getting existing helm release", err)
 				return err
 			}
 		} else {
@@ -589,7 +602,7 @@ func (hrsi *SubscriberItem) manageHelmCR(indexFile *repo.IndexFile, repoURL stri
 
 		if err != nil {
 			klog.Error("Failed to mashall helm release", helmRelease)
-			continue
+			return err
 		}
 
 		dplanno := make(map[string]string)
@@ -607,7 +620,7 @@ func (hrsi *SubscriberItem) manageHelmCR(indexFile *repo.IndexFile, repoURL stri
 
 			pkgMap[dpl.GetName()] = true
 
-			continue
+			return err
 		}
 
 		dplkey := types.NamespacedName{

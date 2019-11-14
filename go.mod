@@ -4,10 +4,9 @@ require (
 	github.com/IBM/multicloud-operators-channel v0.0.0-20191106021206-61ab358c6b28
 	github.com/IBM/multicloud-operators-deployable v0.0.0-20191106030805-be79868c4e0f
 	github.com/IBM/multicloud-operators-placementrule v0.0.0-20191106021205-80eeda99597f
-	github.com/IBM/multicloud-operators-subscription-release v0.0.0-20191106155505-7505f98ccabb
+	github.com/IBM/multicloud-operators-subscription-release v0.0.0-20191113021739-e857b89e2bc4
 	github.com/aws/aws-sdk-go-v2 v0.15.0
 	github.com/blang/semver v3.5.1+incompatible
-	github.com/docker/docker v0.7.3-0.20190409004836-2e1cfbca03da
 	github.com/ghodss/yaml v1.0.1-0.20180820084758-c7ce16629ff4
 	github.com/go-openapi/spec v0.19.0
 	github.com/onsi/gomega v1.5.0
@@ -18,7 +17,6 @@ require (
 	github.com/stretchr/testify v1.3.0
 	golang.org/x/net v0.0.0-20191105084925-a882066a44e0
 	gopkg.in/src-d/go-git.v4 v4.13.1
-	gopkg.in/yaml.v2 v2.2.2
 	k8s.io/api v0.0.0
 	k8s.io/apiextensions-apiserver v0.0.0
 	k8s.io/apimachinery v0.0.0
